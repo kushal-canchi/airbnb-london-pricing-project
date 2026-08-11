@@ -13,18 +13,33 @@ supervisor feedback:
      right-skewed (median ~£156, max ~£2,900+), which is standard for
      accommodation pricing data and is the reason hedonic pricing models
      since Rosen (1974) conventionally use log(price) as the DV.
-  3. The 337 listings with no rating/review_count are KEPT, not dropped
-     and not imputed with a plausible rating. is_new_listing (already a
-     boolean column from the scraper) is used as a dummy predictor, and
-     rating/review_count are zero-filled ONLY for the rows where
-     is_new_listing is True, so the model can still be estimated on the
-     full sample without pretending to know a rating that was never
-     observed. is_new_listing absorbs the effect of that placeholder.
-  4. The 105 hotel-brand rows (is_hotel_brand) are excluded from the main
+  3. Listings with no rating (is_new_listing == True) are NOT pooled into
+     the same model as rated listings. An earlier version zero-filled
+     rating/review_count for these rows and added is_new_listing as a
+     dummy predictor - but VIF diagnostics showed this creates near-
+     perfect structural collinearity (VIF > 120 on both is_new_listing
+     and rating), because rating == 0 if and only if is_new_listing ==
+     True for most of the sample: one variable is almost entirely
+     predictable from the other by construction, not because of any real
+     relationship. Rather than mask that with LASSO, the sample is now
+     split the same way hotel-brand listings already were (rule 4):
+     rated and unrated listings are modelled separately, so no model
+     ever has to hold both a variable and its own "this was missing"
+     flag at the same time.
+  4. The 115 hotel-brand rows (is_hotel_brand) are excluded from the main
      model - a hedonic model is about peer-to-peer host pricing, and a
      commercial hotel product priced by different logic would distort
      the coefficients if pooled in. They are modelled separately below
      as a supplementary result, not silently dropped from the project.
+
+This produces four groups (peer-to-peer / hotel-brand, crossed with
+rated / new-and-unrated), modelled separately wherever there are enough
+rows to fit meaningfully:
+
+  A. MAIN MODEL           peer-to-peer, rated       (~2,096 rows) - RQ1
+  B. SUPPLEMENTARY        peer-to-peer, new/unrated (~308 rows)
+  C. SUPPLEMENTARY        hotel-brand, rated        (~103 rows)
+  D. (not modelled)       hotel-brand, new/unrated  (~12 rows - too few)
 
 USAGE
     python hedonic_pricing_model.py
@@ -33,13 +48,24 @@ Edit INPUT_FILE below to point at your cleaned, borough-fixed dataset
 (the output of apply_minimum_borough_fix.py, or your final feature-
 engineered CSV if that step has already folded this one in).
 
-Requires: pandas, numpy, statsmodels
-    pip install pandas numpy statsmodels
+Requires: pandas, numpy, statsmodels, patsy
+    pip install pandas numpy statsmodels patsy
 """
 
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
+from patsy import dmatrices
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# Proposal's own success criterion (Section 5): VIF < 5 for all retained
+# predictors. The commonly-cited rule-of-thumb ceiling is VIF > 10 -
+# reported separately below since the proposal's threshold is stricter.
+VIF_THRESHOLD = 5
+
+# Below this row count, a subgroup is reported (count, descriptive stats)
+# but not modelled - too few rows to fit meaningfully.
+MIN_ROWS_TO_MODEL = 20
 
 # ------------------------------------------------------------------
 # CONFIG - edit to match your file and column names
@@ -48,17 +74,20 @@ INPUT_FILE = "airbnb_london_full33_pricebands_20260804_1347_features.csv"
 
 DV_COLUMN = "price_gbp_per_night"          # raw nightly price before log transform
 
-# Predictors to include in the main model. Adjust to match whatever
-# feature-engineering has added (e.g. distance_to_center, bedrooms) -
-# just never add price_band_label, price_band_min, price_band_max,
-# price_gbp_total, or price_raw: all of these are derived from price.
+# Predictors used for RATED subgroups (groups A and C above) - includes
+# rating/log_review_count, since those are meaningful here.
 # listing_type (from feature_engineering.py) replaces property_type here -
 # it's a finer-grained version of the same information (e.g. it separates
 # "Room" from "Guest suite" and "Townhouse", which property_type folds
 # together), so use one or the other, not both.
 CATEGORICAL_PREDICTORS = ["zone", "listing_type"]      # add "search_borough" here instead of "zone" for the 33-borough version of the model
-NUMERIC_PREDICTORS = ["rating", "log_review_count"]      # rating zero-filled for is_new_listing rows, see prepare_model_data(); log_review_count from feature_engineering.py
-DUMMY_PREDICTORS = ["is_new_listing"]
+RATED_NUMERIC_PREDICTORS = ["rating", "log_review_count"]
+
+# Predictors used for the NEW/UNRATED subgroup (group B) - rating and
+# log_review_count are constant (0) for every row in this subgroup by
+# definition, so including them would just be dead columns; is_new_listing
+# is dropped too since it's constant True.
+UNRATED_NUMERIC_PREDICTORS = []
 
 # Columns that must NEVER be used as predictors, kept here as an explicit
 # guard so a later edit can't accidentally reintroduce them.
@@ -74,9 +103,10 @@ def load_dataset(path):
 
 def prepare_model_data(df):
     """
-    Applies housekeeping rules 2 and 3, and returns the DataFrame used to
-    build the main-model formula, plus the two other views needed for
-    rules 1 and 4 (asserted / applied at the formula-building stage).
+    Applies housekeeping rule 2 (log-transform the DV) and returns the
+    full DataFrame. Rule 3's rated/unrated split now happens in __main__,
+    not here - no zero-filling of rating/review_count is needed since
+    the two subgroups are modelled separately.
     """
     df = df.copy()
 
@@ -90,22 +120,6 @@ def prepare_model_data(df):
               f"{DV_COLUMN} before log transform (cannot take log of these).")
         df = df.loc[~invalid_price].copy()
     df["log_price"] = np.log(df[DV_COLUMN])
-
-    # Rule 3: keep unrated listings, zero-fill rating/review_count ONLY
-    # for those rows (is_new_listing == True), and rely on is_new_listing
-    # as the dummy that tells the model "this zero is a placeholder, not
-    # a genuinely low rating/zero reviews".
-    for col in ["rating", "review_count"]:
-        if col in df.columns:
-            missing_before = df[col].isna().sum()
-            df[col] = df[col].fillna(0)
-            print(f"  {col}: zero-filled {missing_before} missing values "
-                  f"(all should correspond to is_new_listing == True rows).")
-
-    mismatched = df.loc[df["is_new_listing"] != (df["rating"] == 0), "is_new_listing"]
-    if not mismatched.empty:
-        print(f"  NOTE: {len(mismatched)} rows have is_new_listing inconsistent with "
-              f"a zero rating - worth spot-checking before trusting the dummy fully.")
 
     return df
 
@@ -138,37 +152,84 @@ def run_model(df, formula, label):
     return model
 
 
+def compute_vif(df, formula, label):
+    """
+    Builds the same design matrix statsmodels fits on (dummy-coded
+    categoricals included) and computes VIF per column. The Intercept
+    column is excluded from the report - its VIF is not meaningful.
+    """
+    y, X = dmatrices(formula, data=df, return_type="dataframe")
+    vif = pd.DataFrame({
+        "predictor": X.columns,
+        "VIF": [variance_inflation_factor(X.values, i) for i in range(X.shape[1])],
+    })
+    vif = vif.loc[vif["predictor"] != "Intercept"].sort_values("VIF", ascending=False)
+
+    print(f"\n--- VIF diagnostics: {label} ---")
+    print(vif.to_string(index=False))
+
+    over_proposal_threshold = vif.loc[vif["VIF"] >= VIF_THRESHOLD]
+    over_rule_of_thumb = vif.loc[vif["VIF"] >= 10]
+    if over_rule_of_thumb.empty and over_proposal_threshold.empty:
+        print(f"All predictors are below VIF {VIF_THRESHOLD} - no multicollinearity "
+              f"concern, proposal's success criterion is met, LASSO robustness "
+              f"check is not required by the proposal's own conditional trigger.")
+    elif over_rule_of_thumb.empty:
+        print(f"No predictor exceeds the VIF>10 rule-of-thumb ceiling, but "
+              f"{len(over_proposal_threshold)} exceed the proposal's stricter "
+              f"VIF<{VIF_THRESHOLD} success criterion - worth noting as a limitation "
+              f"even if a LASSO check isn't strictly triggered.")
+    else:
+        print(f"WARNING: {len(over_rule_of_thumb)} predictor(s) exceed VIF>10 - "
+              f"multicollinearity detected, run LASSO as a robustness check per "
+              f"the proposal's Section 4.3 risk mitigation.")
+    return vif
+
+
 if __name__ == "__main__":
     print(f"Loading {INPUT_FILE} ...")
     df = load_dataset(INPUT_FILE)
     df = prepare_model_data(df)
 
-    formula = build_formula(
+    if "is_hotel_brand" not in df.columns or "is_new_listing" not in df.columns:
+        raise KeyError("Expected both is_hotel_brand and is_new_listing columns - "
+                        "check the input file is the feature-engineered dataset.")
+
+    rated_formula = build_formula(
         dv="log_price",
         categorical=CATEGORICAL_PREDICTORS,
-        numeric=NUMERIC_PREDICTORS,
-        dummy=DUMMY_PREDICTORS,
+        numeric=RATED_NUMERIC_PREDICTORS,
+        dummy=[],
+    )
+    unrated_formula = build_formula(
+        dv="log_price",
+        categorical=CATEGORICAL_PREDICTORS,
+        numeric=UNRATED_NUMERIC_PREDICTORS,
+        dummy=[],
     )
 
-    # Rule 4: main model excludes hotel-brand rows entirely.
-    if "is_hotel_brand" in df.columns:
-        main_df = df.loc[~df["is_hotel_brand"]].copy()
-        hotel_df = df.loc[df["is_hotel_brand"]].copy()
-        print(f"\nExcluding {len(hotel_df)} hotel-brand rows from the main model "
-              f"({len(main_df)} peer-to-peer listings remain).")
-    else:
-        print("\nWARNING: is_hotel_brand column not found - main model will include "
-              "any hotel/aparthotel-brand listings. Check the input file.")
-        main_df = df.copy()
-        hotel_df = pd.DataFrame()
+    is_hotel = df["is_hotel_brand"].astype(bool)
+    is_new = df["is_new_listing"].astype(bool)
 
-    main_model = run_model(main_df, formula, "MAIN MODEL (peer-to-peer listings only)")
+    groups = {
+        "MAIN MODEL (peer-to-peer, rated listings)": (~is_hotel & ~is_new, rated_formula),
+        "SUPPLEMENTARY (peer-to-peer, new/unrated listings)": (~is_hotel & is_new, unrated_formula),
+        "SUPPLEMENTARY (hotel-brand, rated listings)": (is_hotel & ~is_new, rated_formula),
+        "NOT MODELLED (hotel-brand, new/unrated listings)": (is_hotel & is_new, None),
+    }
 
-    # Supplementary result: hotel-brand listings modelled separately,
-    # not silently discarded from the project.
-    if len(hotel_df) >= 20:  # arbitrary floor - too few rows to fit meaningfully below this
-        hotel_model = run_model(hotel_df, formula, "SUPPLEMENTARY MODEL (hotel-brand listings only)")
-    else:
-        print(f"\nSkipping supplementary hotel-brand model - only {len(hotel_df)} rows, "
-              f"too few to fit meaningfully. Report the count and describe them "
-              f"qualitatively instead.")
+    print("\nGroup sizes:")
+    for label, (mask, _) in groups.items():
+        print(f"  {label}: {mask.sum()} rows")
+
+    fitted_models = {}
+    for label, (mask, formula) in groups.items():
+        group_df = df.loc[mask].copy()
+        if formula is None or len(group_df) < MIN_ROWS_TO_MODEL:
+            print(f"\nSkipping '{label}' - only {len(group_df)} rows, "
+                  f"too few to fit meaningfully. Report the count and describe "
+                  f"qualitatively instead.")
+            continue
+        model = run_model(group_df, formula, label)
+        compute_vif(group_df, formula, label)
+        fitted_models[label] = model
