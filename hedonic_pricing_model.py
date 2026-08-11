@@ -44,7 +44,7 @@ import statsmodels.formula.api as smf
 # ------------------------------------------------------------------
 # CONFIG - edit to match your file and column names
 # ------------------------------------------------------------------
-INPUT_FILE = "airbnb_london_borough_fixed.csv"
+INPUT_FILE = "airbnb_london_full33_pricebands_20260804_1347_features.csv"
 
 DV_COLUMN = "price_gbp_per_night"          # raw nightly price before log transform
 
@@ -52,8 +52,12 @@ DV_COLUMN = "price_gbp_per_night"          # raw nightly price before log transf
 # feature-engineering has added (e.g. distance_to_center, bedrooms) -
 # just never add price_band_label, price_band_min, price_band_max,
 # price_gbp_total, or price_raw: all of these are derived from price.
-CATEGORICAL_PREDICTORS = ["zone", "property_type"]      # add "search_borough" here instead of "zone" for the 33-borough version of the model
-NUMERIC_PREDICTORS = ["rating", "review_count"]          # zero-filled for is_new_listing rows, see prepare_model_data()
+# listing_type (from feature_engineering.py) replaces property_type here -
+# it's a finer-grained version of the same information (e.g. it separates
+# "Room" from "Guest suite" and "Townhouse", which property_type folds
+# together), so use one or the other, not both.
+CATEGORICAL_PREDICTORS = ["zone", "listing_type"]      # add "search_borough" here instead of "zone" for the 33-borough version of the model
+NUMERIC_PREDICTORS = ["rating", "log_review_count"]      # rating zero-filled for is_new_listing rows, see prepare_model_data(); log_review_count from feature_engineering.py
 DUMMY_PREDICTORS = ["is_new_listing"]
 
 # Columns that must NEVER be used as predictors, kept here as an explicit

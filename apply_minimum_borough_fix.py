@@ -1,29 +1,38 @@
 """
 apply_minimum_borough_fix.py
 ------------------------------------------------------------------------------------
-Applies the MINIMUM acceptable fix (per supervisor feedback) to an already-
-collected Airbnb London dataset, without re-scraping anything:
+Applies the minimum acceptable fix (per supervisor feedback, round 2) to an
+already-collected Airbnb London dataset, without re-scraping anything:
 
-  1. Renames the column recording which borough was searched from
-     search_location to search_borough, so the column name itself is
+  1. Renames search_location -> search_borough, so the column name is
      honest about what it measures (the query, not a verified per-listing
      location).
-  2. Drops any row whose search_borough is not one of the 33 official
-     London boroughs (i.e. is None/blank, or names somewhere outside
-     Greater London - Surrey, Essex, Hertfordshire, Berkshire, Windsor,
-     etc.). These rows cannot be trusted as "London" observations for a
-     London hedonic pricing model.
-  3. Prints a before/after summary so the drop is documented and
-     reproducible, not silent.
-
-This does NOT fix the deeper issue that deduplication credits an
-overlapping listing to whichever borough sorts first alphabetically
-(see KNOWN LIMITATIONS in the scraper's docstring) - that requires the
-full second-pass fix (per-listing coordinates + point-in-polygon against
-an ONS boundary file), which was deliberately out of scope for this
-minimum fix given the time available. State this plainly as a limitation
-in the methodology chapter; the paragraph in borough_limitation_note.md
-(generated alongside this script) is ready to paste in.
+  2. Screens for out-of-Greater-London listings using the LISTING TITLE,
+     not search_borough. search_borough only ever holds the 33 borough
+     query strings this scraper supplies (see FULL_LOCATIONS in the
+     scraper), so a row-level check against that column can never fail
+     and drops nothing - this was flagged in supervisor feedback as the
+     bug in the previous version of this script.
+     Airbnb listing titles follow a "<type> in <place>" pattern (e.g.
+     "Room in Croydon", "Cabin in Esher"). The trailing place name is
+     extracted and checked against NON_LONDON_PLACES, a curated list of
+     Home Counties towns/villages and county names that fall outside the
+     Greater London boundary but get pulled into borough-radius searches
+     near the edge of London (concentrated under Hillingdon, Havering,
+     Harrow, Sutton, Kingston, Croydon, Hounslow, Enfield, Redbridge -
+     i.e. the boroughs that actually border Surrey/Essex/Herts/Bucks/
+     Berks/Kent). Matches are dropped.
+     Hotel-brand listings (is_hotel_brand == True) don't follow the
+     "<type> in <place>" title pattern, so no location can be extracted
+     for them. None of their titles reference any non-London county name,
+     so they are kept as-is rather than dropped for having no extractable
+     location.
+     A trailing place name that doesn't parse, or isn't unambiguously
+     identifiable as London or non-London, is dropped as unverifiable
+     rather than assumed valid.
+  3. Prints a before/after summary, broken down by search_borough and by
+     the specific place name that caused a drop, so the fix is documented
+     and reproducible, not silent.
 
 USAGE
     python apply_minimum_borough_fix.py
@@ -34,17 +43,63 @@ identifier column isn't named room_id.
 """
 
 import os
+import re
 import pandas as pd
 
 # ------------------------------------------------------------------
 # CONFIG - edit these two lines to match your files
 # ------------------------------------------------------------------
-INPUT_FILE = "checkpoint_listings.csv"   # or your final deduplicated CSV/XLSX
+INPUT_FILE = "airbnb_london_full33_pricebands_20260804_1347.csv"
 ID_COLUMN = "room_id"
 
-# The 33 official London boroughs, exactly as queried by the scraper.
-# A row is kept only if its search_borough / search_location value is
-# in this list (falls back to a same-length case-insensitive match).
+# Regex for the trailing place name in an Airbnb listing title, e.g.
+# "Room in Croydon" -> "Croydon", "Home in Northwood, London" ->
+# "Northwood, London". Requires a leading space before "in" so it can't
+# false-match inside a word ending in "in" (e.g. "Cabin in Hackney").
+TITLE_LOCATION_RE = re.compile(r" in ([^,]+(?:, [^,]+)?)$")
+
+# Place names / counties that appear in listing titles but fall outside
+# the Greater London boundary. Curated by cross-checking every unique
+# trailing title location in the 04/08 dataset against Greater London's
+# 33-borough boundary. Matched case-insensitively, exact match on the
+# extracted trailing location (not substring), to avoid accidentally
+# rejecting a London place whose name happens to contain one of these
+# as a substring.
+NON_LONDON_PLACES = {
+    # Explicit county / unitary authority names
+    "surrey", "essex", "hertfordshire", "berkshire", "buckinghamshire",
+    "kent", "thurrock", "bracknell forest",
+    # Surrey towns/villages (outside Greater London)
+    "addlestone", "banstead", "chipstead", "chobham", "dorking",
+    "east molesey", "esher", "ewell", "fetcham", "godstone",
+    "kingswood", "lower kingswood", "merstham", "staines-upon-thames",
+    "stoke d'abernon", "sunbury-on-thames", "warlingham", "woldingham",
+    # Hertfordshire towns/villages
+    "cheshunt", "chorleywood", "elstree", "potters bar",
+    # Buckinghamshire towns/villages
+    "beaconsfield", "chalfont saint peter", "denham", "farnham common",
+    "gerrards cross", "hedgerley", "middle green", "stoke poges",
+    # Berkshire towns/villages
+    "colnbrook", "dorney", "englefield green", "langley", "old windsor",
+    "slough", "taplow", "windsor", "windsor and maidenhead", "wraysbury",
+    # Essex / Thurrock towns/villages
+    "aveley", "buckhurst hill", "bulphan", "chafford hundred", "chigwell",
+    "dunton", "fyfield", "great warley", "loughton", "margaretting",
+    "moreton", "navestock", "shenfield", "southend-on-sea",
+    "stapleford abbotts", "stapleford tawney", "theydon bois", "warley",
+    # Kent towns/villages
+    "cliffe", "medway", "meopham south",
+}
+
+# Trailing title locations that cannot be verified either way (too
+# generic / not a real place name) and are dropped as unverifiable
+# rather than assumed to be inside London.
+UNVERIFIABLE_PLACES = {"uk"}
+
+# The 33 official London boroughs, exactly as queried by the scraper -
+# kept for the search_borough validity check (step 2 of the ORIGINAL
+# fix). Still useful as a sanity check even though the real screen now
+# runs on title, not this column.
 VALID_LONDON_BOROUGHS = [
     "Barking and Dagenham, London, United Kingdom", "Barnet, London, United Kingdom",
     "Bexley, London, United Kingdom", "Brent, London, United Kingdom",
@@ -64,7 +119,7 @@ VALID_LONDON_BOROUGHS = [
     "Wandsworth, London, United Kingdom", "Westminster, London, United Kingdom",
     "City of London, United Kingdom",
 ]
-_VALID_LOWER = {b.strip().lower() for b in VALID_LONDON_BOROUGHS}
+_VALID_BOROUGH_LOWER = {b.strip().lower() for b in VALID_LONDON_BOROUGHS}
 
 
 def load_dataset(path):
@@ -75,9 +130,18 @@ def load_dataset(path):
     if ext == ".csv":
         return pd.read_csv(path, dtype=dtype)
     elif ext in (".xlsx", ".xls"):
-        df = pd.read_excel(path, dtype=dtype)
-        return df
+        return pd.read_excel(path, dtype=dtype)
     raise ValueError(f"Unsupported file type: {ext}")
+
+
+def extract_title_location(title):
+    """Pulls the trailing '<type> in <place>' location out of a listing
+    title. Returns None if the title doesn't follow that pattern (this
+    is expected and fine for hotel-brand listings)."""
+    if not isinstance(title, str):
+        return None
+    m = TITLE_LOCATION_RE.search(title)
+    return m.group(1).strip() if m else None
 
 
 def apply_minimum_borough_fix(df):
@@ -93,25 +157,48 @@ def apply_minimum_borough_fix(df):
             "file's columns. Check INPUT_FILE points at the right dataset."
         )
 
+    if "search_borough" in df.columns:
+        bad_query = ~df["search_borough"].astype(str).str.strip().str.lower().isin(_VALID_BOROUGH_LOWER)
+        if bad_query.any():
+            print(f"  NOTE: {bad_query.sum()} row(s) have a search_borough value outside "
+                  f"the 33 queried boroughs - unexpected, worth a look.")
+
     before = len(df)
 
-    # Step 2: keep only rows whose queried borough is one of the 33
-    # official London boroughs. Blank/missing values and anything naming
-    # a place outside Greater London (Surrey, Essex, Hertfordshire,
-    # Berkshire, Windsor, etc.) are dropped here.
-    is_valid = df["search_borough"].astype(str).str.strip().str.lower().isin(_VALID_LOWER)
-    dropped = df.loc[~is_valid, "search_borough"].value_counts()
-    df = df.loc[is_valid].reset_index(drop=True)
+    # Step 2: screen using the LISTING TITLE, not search_borough (see
+    # module docstring for why search_borough can't do this job).
+    df["_title_location"] = df["title"].apply(extract_title_location)
+
+    is_hotel_brand = df.get("is_hotel_brand", pd.Series(False, index=df.index)).astype(str).str.lower().eq("true")
+    loc_lower = df["_title_location"].astype(str).str.strip().str.lower()
+
+    is_non_london = loc_lower.isin(NON_LONDON_PLACES)
+    is_unverifiable = loc_lower.isin(UNVERIFIABLE_PLACES)
+    # No location could be extracted AND it isn't a hotel-brand listing
+    # (hotel-brand titles legitimately don't follow the "in <place>"
+    # pattern; anything else with no extractable location is suspect).
+    no_location_non_hotel = df["_title_location"].isna() & ~is_hotel_brand
+
+    to_drop = is_non_london | is_unverifiable | no_location_non_hotel
+
+    dropped_by_place = df.loc[is_non_london | is_unverifiable, "_title_location"].value_counts()
+    dropped_by_borough = df.loc[to_drop, "search_borough"].value_counts() if "search_borough" in df.columns else None
+
+    df = df.loc[~to_drop].drop(columns=["_title_location"]).reset_index(drop=True)
     after = len(df)
 
     print(f"\nRows before: {before}")
     print(f"Rows after:  {after}")
-    print(f"Rows dropped: {before - after}")
-    if not dropped.empty:
-        print("\nDropped rows by search_borough value (out-of-London / blank):")
-        print(dropped.to_string())
-    else:
-        print("\nNo out-of-London or blank search_borough rows found.")
+    print(f"Rows dropped: {before - after} ({100 * (before - after) / before:.1f}%)")
+    if not dropped_by_place.empty:
+        print("\nDropped rows by title location (out-of-Greater-London / unverifiable):")
+        print(dropped_by_place.to_string())
+    if dropped_by_borough is not None and not dropped_by_borough.empty:
+        print("\nDropped rows by search_borough (i.e. which borough's radius pulled them in):")
+        print(dropped_by_borough.to_string())
+    if no_location_non_hotel.any():
+        print(f"\n{no_location_non_hotel.sum()} row(s) dropped for having no extractable "
+              f"title location and not being a hotel-brand listing - worth a manual look.")
 
     return df
 
@@ -132,5 +219,5 @@ if __name__ == "__main__":
         "observations, but it does NOT correct the alphabetical-"
         "deduplication undercount of Newham / Tower Hamlets / City of "
         "London. State that plainly as a limitation (see "
-        "borough_limitation_note.md)."
+        "dataset_limitations_note.md)."
     )

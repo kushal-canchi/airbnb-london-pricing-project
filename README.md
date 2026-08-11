@@ -29,10 +29,20 @@ airbnb_london_full33_pricebands_<timestamp>.xlsx  +  .csv (canonical)
         │
         ▼
 apply_minimum_borough_fix.py
-        │  (renames search_location → search_borough, drops rows outside
-        │   Greater London)
+        │  (renames search_location → search_borough; screens each row's
+        │   title-derived location against Greater London and drops rows
+        │   outside it — search_borough itself can't be used for this,
+        │   since it only ever holds the 33 queried borough strings)
         ▼
 <dataset>_borough_fixed.csv
+        │
+        ▼
+feature_engineering.py
+        │  (drops constant/dead columns, resolves one rating data-quality
+        │   exception, adds listing_type from the title and
+        │   log_review_count)
+        ▼
+<dataset>_features.csv
         │
         ▼
 hedonic_pricing_model.py
@@ -48,9 +58,12 @@ Regression results (main model + supplementary hotel-brand model)
 | File | Role |
 |---|---|
 | `airbnb_scraper_full33_pricebands_final.ipynb` | **The scraper used to produce the committed dataset.** Selenium + BeautifulSoup, 33 boroughs × 6 price bands (198 queries), checkpointed/resumable, deduplicated by `room_id`. Outputs a timestamped `.xlsx` and canonical `.csv`. Run this top-to-bottom to reproduce or extend the dataset. |
-| `airbnb_london_full33_pricebands_20260729_1148.xlsx` | Output of the scraper above — the raw, deduplicated dataset before the borough/cleaning fixes below. Kept as the original artifact; the `.csv` companion (produced when the notebook is re-run) is the canonical copy going forward, since `room_id` is a long identifier string that Excel can silently corrupt on re-save. |
-| `apply_minimum_borough_fix.py` | Post-collection cleaning step. Renames the borough column to `search_borough` (making explicit that it records the *queried* borough, not a verified per-listing location) and drops rows naming places outside Greater London. Run this against the scraper's output before modelling. |
-| `hedonic_pricing_model.py` | The regression script. Log-transforms nightly price as the dependent variable, excludes `price_band_label` and other price-derived columns as predictors, keeps unrated listings via an `is_new_listing` dummy instead of imputing ratings, and fits the main model on peer-to-peer listings only (hotel-brand listings are modelled separately as a supplementary result). |
+| `airbnb_london_full33_pricebands_20260804_1347.xlsx` | Output of the scraper above — the raw, deduplicated dataset before the borough/cleaning fixes below, regenerated from the current canonical `.csv` (the previous `_20260729_1148.xlsx` was a stale July export with a different row count/column set and has been removed). The `.csv` companion is still the canonical copy for downstream work, since `room_id` is a long identifier string that Excel can silently corrupt on re-save. |
+| `apply_minimum_borough_fix.py` | Post-collection cleaning step. Renames the borough column to `search_borough` (making explicit that it records the *queried* borough, not a verified per-listing location) and drops rows whose listing **title** names a place outside Greater London — `search_borough` itself only ever holds the 33 queried borough strings, so it can't be used to detect this. Run this against the scraper's output before modelling. |
+| `airbnb_london_full33_pricebands_20260804_1347_borough_fixed.csv` | Output of `apply_minimum_borough_fix.py`. Intermediate file, kept for transparency on what the geographic filter removed — not the file to build on further. |
+| `feature_engineering.py` | Cleaning + feature engineering step, run on the borough-fixed dataset. Drops `nights`/`nights_source` (constant across every row), drops one row with an unresolvable rating/review_count/is_new_listing inconsistency, and adds two predictors: `listing_type` (a finer-grained category parsed from the listing title — e.g. separates "Room" from "Guest suite" and "Townhouse", which `property_type` folds together) and `log_review_count` (log1p of `review_count`, since it's heavily right-skewed). |
+| `airbnb_london_full33_pricebands_20260804_1347_features.csv` | **Output of `feature_engineering.py` — this is the canonical file for all further work** (modelling, write-up, any additional analysis). 2,519 rows, cleaned and feature-engineered. `hedonic_pricing_model.py` reads this file directly. |
+| `hedonic_pricing_model.py` | The regression script. Log-transforms nightly price as the dependent variable, excludes `price_band_label` and other price-derived columns as predictors, keeps unrated listings via an `is_new_listing` dummy instead of imputing ratings, uses `listing_type`/`log_review_count` from the feature engineering step, and fits the main model on peer-to-peer listings only (hotel-brand listings are modelled separately as a supplementary result). |
 | `scraper_21_07_fix.ipynb` | **Superseded.** An earlier 33-borough version that queried each borough once (no price-band splitting), which plateaued at roughly one page of results per borough (~1,000 rows total) before Airbnb started re-serving already-seen listings. Replaced by the price-band-split design in the final notebook, which multiplies unique results per borough instead of fighting that per-query depth limit. Kept for transparency on how the design evolved; not used to produce any data in the final dataset. |
 | `airbnb_scraper_zones.py` | **Superseded.** The original prototype scraper — 6 boroughs only, no price-band splitting, no checkpointing, no `room_id`-based deduplication. Superseded by both later scrapers above. Kept for transparency; not used to produce any data in the final dataset. |
 | `requirements.txt` | Pinned package versions for the scraper and modelling environment. |
@@ -85,9 +98,14 @@ pip install -r requirements.txt
 #    (edit INPUT_FILE at the top of the script to point at your .csv)
 python apply_minimum_borough_fix.py
 
-# 2. Fit the hedonic pricing regression
+# 2. Clean and feature-engineer
 #    (edit INPUT_FILE at the top of the script to point at the
 #    *_borough_fixed.csv produced above)
+python feature_engineering.py
+
+# 3. Fit the hedonic pricing regression
+#    (edit INPUT_FILE at the top of the script to point at the
+#    *_features.csv produced above)
 python hedonic_pricing_model.py
 ```
 
@@ -95,8 +113,10 @@ python hedonic_pricing_model.py
 
 - **Spatial measurement error.** `search_borough` records which borough
   was queried, not a verified location for each listing — Airbnb's search
-  radius crosses borough lines. Rows outside Greater London are dropped
-  by `apply_minimum_borough_fix.py`, but deduplication still credits an
+  radius crosses borough lines. Rows outside Greater London are identified
+  from the listing title and dropped by `apply_minimum_borough_fix.py`
+  (205 of 2,725 rows, 7.5%, concentrated in Hillingdon, Havering, Sutton,
+  Croydon, Hounslow, and Harrow), but deduplication still credits an
   overlapping listing to whichever borough sorts first alphabetically,
   which understates density in boroughs bordering many others (Newham,
   Tower Hamlets, City of London in particular).
