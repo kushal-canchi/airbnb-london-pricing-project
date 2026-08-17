@@ -57,6 +57,7 @@ import pandas as pd
 import statsmodels.formula.api as smf
 from patsy import dmatrices
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.stats.diagnostic import het_breuschpagan
 
 # Proposal's own success criterion (Section 5): VIF < 5 for all retained
 # predictors. The commonly-cited rule-of-thumb ceiling is VIF > 10 -
@@ -186,6 +187,59 @@ def compute_vif(df, formula, label):
     return vif
 
 
+def compute_robust_and_clustered_se(model, df, formula, cluster_col, label):
+    """
+    Refits `model` with HC3-robust and cluster-robust (by `cluster_col`)
+    standard errors, and reports a residual intraclass correlation (ICC)
+    for `cluster_col`. This is the same specification comparison reported
+    in the dissertation (Section 3.4, Table 2): a Breusch-Pagan test
+    motivates HC3, but HC3 alone does not correct for within-cluster
+    error correlation, so the residual ICC is checked directly and
+    borough-clustered standard errors are adopted as the PRIMARY
+    specification whenever that ICC is non-negligible.
+
+    Returns (model_hc3, model_clustered, icc) so callers can use the
+    clustered p-values as the primary significance test.
+    """
+    model_hc3 = smf.ols(formula=formula, data=df).fit(cov_type="HC3")
+    model_clustered = smf.ols(formula=formula, data=df).fit(
+        cov_type="cluster", cov_kwds={"groups": df[cluster_col]}
+    )
+
+    resid_df = pd.DataFrame({"resid": model.resid, "group": df[cluster_col]})
+    grand_mean = resid_df["resid"].mean()
+    group_means = resid_df.groupby("group")["resid"].mean()
+    group_ns = resid_df.groupby("group")["resid"].size()
+    k = len(group_ns)
+    n = len(resid_df)
+    ss_between = (group_ns * (group_means - grand_mean) ** 2).sum()
+    ss_total = ((resid_df["resid"] - grand_mean) ** 2).sum()
+    ms_between = ss_between / (k - 1)
+    ms_within = (ss_total - ss_between) / (n - k)
+    n0 = (n - (group_ns ** 2).sum() / n) / (k - 1)
+    icc = (ms_between - ms_within) / (ms_between + (n0 - 1) * ms_within)
+
+    print(f"\n--- Standard-error specification comparison: {label} ---")
+    bp_stat, bp_p, _, _ = het_breuschpagan(model.resid, model.model.exog)
+    print(f"Breusch-Pagan LM statistic: {bp_stat:.2f}, p-value: {bp_p:.2e} "
+          f"({'rejects' if bp_p < 0.05 else 'fails to reject'} homoskedasticity)")
+    print(f"Residual ICC by {cluster_col} ({k} groups, N={n}): {icc:.4f} "
+          f"(~{icc*100:.1f}% of residual variance sits between groups)")
+    print("PRIMARY specification used throughout the dissertation: standard errors "
+          f"clustered by {cluster_col}, since HC3 alone does not correct for the "
+          "within-group correlation the ICC above indicates.")
+
+    comparison = pd.DataFrame({
+        "coef": model.params,
+        "p_conventional": model.pvalues,
+        "p_hc3": model_hc3.pvalues,
+        "p_clustered": model_clustered.pvalues,
+    }).round(4)
+    print(comparison.to_string())
+
+    return model_hc3, model_clustered, icc
+
+
 if __name__ == "__main__":
     print(f"Loading {INPUT_FILE} ...")
     df = load_dataset(INPUT_FILE)
@@ -223,6 +277,7 @@ if __name__ == "__main__":
         print(f"  {label}: {mask.sum()} rows")
 
     fitted_models = {}
+    fitted_dfs = {}
     for label, (mask, formula) in groups.items():
         group_df = df.loc[mask].copy()
         if formula is None or len(group_df) < MIN_ROWS_TO_MODEL:
@@ -233,3 +288,18 @@ if __name__ == "__main__":
         model = run_model(group_df, formula, label)
         compute_vif(group_df, formula, label)
         fitted_models[label] = model
+        fitted_dfs[label] = group_df
+
+    # The main RQ1 model (peer-to-peer, rated listings) is the one Table 2 of
+    # the dissertation reports, and it is reported there under borough-
+    # clustered standard errors as the primary specification (Section 3.4) -
+    # not the classical/nonrobust ones printed by run_model() above. This
+    # reproduces that comparison here so this script's own output matches
+    # what the dissertation actually reports, rather than only ever printing
+    # the classical specification.
+    main_label = "MAIN MODEL (peer-to-peer, rated listings)"
+    if main_label in fitted_models:
+        compute_robust_and_clustered_se(
+            fitted_models[main_label], fitted_dfs[main_label], rated_formula,
+            cluster_col="search_borough", label=main_label,
+        )
