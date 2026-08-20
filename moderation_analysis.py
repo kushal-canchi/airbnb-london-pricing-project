@@ -104,7 +104,10 @@ def flag_unstable_interactions(model, label, ct, min_cell_n=5):
     """
     interaction_terms = model.params.index[model.params.index.str.contains(":")]
     if len(interaction_terms) == 0:
-        return
+        return {
+            "n_interaction_terms": 0, "n_unstable": 0,
+            "n_significant": 0, "n_stable_significant": 0,
+        }
 
     def cell_n(term):
         # term looks like: C(search_borough)[T.Camden, London, United Kingdom]:C(listing_type)[T.Flat]
@@ -141,6 +144,13 @@ def flag_unstable_interactions(model, label, ct, min_cell_n=5):
     else:
         print(f"\n  No interaction terms are both significant AND backed by "
               f"{min_cell_n}+ listings in that specific cell.")
+
+    return {
+        "n_interaction_terms": len(interaction_terms),
+        "n_unstable": len(unstable),
+        "n_significant": len(significant),
+        "n_stable_significant": len(stable_significant),
+    }
 
 
 def check_primary_specification(model, formula, df, cluster_col, full_ct, reference_level, label, min_cell_n=MIN_CELL_N):
@@ -251,14 +261,14 @@ if __name__ == "__main__":
     })
     print(comparison.to_string(index=False))
 
-    flag_unstable_interactions(model3, "MODEL 3", ct, min_cell_n=MIN_CELL_N)
-    n_sig_model3 = int((model3.pvalues[model3.params.index.str.contains(":")] < 0.05).sum())
+    model3_stats = flag_unstable_interactions(model3, "MODEL 3", ct, min_cell_n=MIN_CELL_N)
+    pct_unstable_model3 = 100 * model3_stats["n_unstable"] / model3_stats["n_interaction_terms"]
 
     zone_ct = pd.crosstab(main_df["zone"], main_df["listing_type"])
     flag_unstable_interactions(model4, "MODEL 4", zone_ct, min_cell_n=MIN_CELL_N)
 
     # Model 3's interaction terms are already the least reliable part of this
-    # analysis (67% below the minimum cell size) - refitting it with HC3
+    # analysis (most of them below the minimum cell size) - refitting it with HC3
     # confirms this rather than rescuing it: several of the sparsest cells
     # produce degenerate (p~1.0) HC3 p-values, a known failure mode when a
     # cell's leverage approaches 1. Model 3 is therefore reported only under
@@ -284,15 +294,19 @@ if __name__ == "__main__":
     print(
         "\n=== Conclusion ===\n"
         f"Model 3 (full borough x listing_type) wins on both AIC and adjusted "
-        f"R-squared, but 172 of its 256 interaction terms (67%) rest on fewer "
+        f"R-squared, but {model3_stats['n_unstable']} of its "
+        f"{model3_stats['n_interaction_terms']} interaction terms "
+        f"({pct_unstable_model3:.0f}%) rest on fewer "
         f"than {MIN_CELL_N} listings in that specific cell - so most of that "
         f"apparent gain is overfitting to sparse cells, exactly as the proposal's "
         f"Section 4.3 risk register anticipated, not evidence of genuine "
         f"borough-level moderation. At the conventional p<0.05 threshold under "
-        f"classical standard errors, {n_sig_model3} of its 256 interaction terms "
+        f"classical standard errors, {model3_stats['n_significant']} of its "
+        f"{model3_stats['n_interaction_terms']} interaction terms "
         f"are nominally significant (Model 3 is not re-estimated under HC3/"
         f"clustered standard errors - see the HC3 sanity check above for why); "
-        f"of those, 39 are backed by at least {MIN_CELL_N} listings and can be "
+        f"of those, {model3_stats['n_stable_significant']} are backed by at least "
+        f"{MIN_CELL_N} listings and can be "
         f"reported as a secondary, descriptive finding - e.g. Room listings "
         f"command an unusually large premium specifically in Havering and "
         f"Hounslow - without treating the full borough model as the headline "
