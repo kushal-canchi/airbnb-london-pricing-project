@@ -1,10 +1,18 @@
 # Scraper (airbnb_scraper_full33_pricebands_final.ipynb)
 selenium==4.46.0
 beautifulsoup4==4.15.0
-pandas==2.3.3
 openpyxl==3.1.5
 webdriver-manager==4.1.2
 
-# Cleaning + modelling (apply_minimum_borough_fix.py, hedonic_pricing_model.py)
-numpy==2.5.1
+# Cleaning + modelling (apply_minimum_borough_fix.py, hedonic_pricing_model.py,
+# moderation_analysis.py). Pinned exactly to the environment the reported
+# regression output (including the moderation_analysis.py diagnostics) was
+# verified against, so a third party can reproduce the same numeric results -
+# not just a compatible range. statsmodels' p-values are computed via scipy,
+# and its formula interface (C(), *) is parsed via patsy, so both are pinned
+# alongside pandas/numpy even though neither is imported directly.
+pandas==3.0.2
+numpy==2.4.4
+scipy==1.17.1
 statsmodels==0.14.6
+patsy==1.0.2
